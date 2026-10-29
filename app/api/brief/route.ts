@@ -92,6 +92,21 @@ type StreamEvent =
   | { type: 'brief'; brief: Brief }
   | { type: 'error'; error: string };
 
+/** Raw API errors are English JSON — the card shows a plain Korean line instead
+ *  (the raw error still goes to the server log). */
+function friendlyError(err: unknown): string {
+  if (err instanceof Anthropic.APIError) {
+    if (/credit balance/i.test(err.message)) return 'AI 사용 크레딧이 모두 소진되었습니다. 관리자가 충전하면 바로 다시 됩니다.';
+    if (err.status === 401 || err.status === 403) return 'AI 서비스 인증에 실패했습니다. API 키 설정을 확인해 주세요.';
+    if (err.status === 429) return '지금 요청이 많아 잠시 막혔습니다. 잠시 뒤 다시 시도해 주세요.';
+    if (err.status === 529 || (err.status ?? 0) >= 500) return 'AI 서비스가 일시적으로 혼잡합니다. 잠시 뒤 다시 시도해 주세요.';
+    return '조사 요청이 처리되지 않았습니다. 잠시 뒤 다시 시도해 주세요.';
+  }
+  if (err instanceof Anthropic.APIConnectionError) return '인터넷 연결이 불안정합니다. 연결을 확인해 주세요.';
+  if (err instanceof Error && /[가-힣]/.test(err.message)) return err.message.slice(0, 200);
+  return '조사 중 문제가 생겼습니다. 잠시 뒤 다시 시도해 주세요.';
+}
+
 function ndjson(run: (send: (e: StreamEvent) => void) => Promise<void>): Response {
   const enc = new TextEncoder();
   const stream = new ReadableStream({
@@ -100,7 +115,8 @@ function ndjson(run: (send: (e: StreamEvent) => void) => Promise<void>): Respons
       try {
         await run(send);
       } catch (err) {
-        send({ type: 'error', error: err instanceof Error ? err.message.slice(0, 200) : 'unknown' });
+        console.error('[brief]', err);
+        send({ type: 'error', error: friendlyError(err) });
       } finally {
         controller.close();
       }
@@ -133,13 +149,22 @@ export async function POST(req: Request) {
   const key = cacheKey(question);
 
   return ndjson(async (send) => {
-    if (useCache && !body.fresh) {
-      const hit = (await readCache())[key];
-      if (hit && Date.now() - new Date(hit.asOf).getTime() < CACHE_TTL_MS) {
-        send({ type: 'brief', brief: { ...hit, cached: true } });
-        return;
-      }
+    const saved = useCache ? (await readCache())[key] : undefined;
+    if (saved && !body.fresh && Date.now() - new Date(saved.asOf).getTime() < CACHE_TTL_MS) {
+      send({ type: 'brief', brief: { ...saved, cached: true } });
+      return;
     }
+    try {
+      await research(send);
+    } catch (err) {
+      // API down (no credit, outage) — an older saved answer beats an error card.
+      if (!saved) throw err;
+      console.error('[brief] research failed, serving saved answer', err);
+      send({ type: 'brief', brief: { ...saved, cached: true } });
+    }
+  });
+
+  async function research(send: (e: StreamEvent) => void) {
     // Only paid research counts toward the limits; saved answers are free.
     const limited = takeRateLimit(req) ?? takeDailyBudget();
     if (limited) throw new Error(limited);
@@ -174,7 +199,7 @@ export async function POST(req: Request) {
       map[key] = brief;
       await writeCache(map);
     }
-  });
+  }
 }
 
 async function quickAnswer(client: Anthropic, question: string, context: string[]): Promise<string | null> {

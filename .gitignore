@@ -36,3 +36,6 @@ Thumbs.db
 
 # saved answers (contain dated market data)
 data/
+
+# local server logs
+*.log
